@@ -14,11 +14,10 @@ workflowDefinition:
       onFailure: abortWorkflow
 
     - externalId: contextualize_ts_assets_task
-      type: function
+      type: transformation
       parameters:
-        function:
+        transformation:
           externalId: contextualize_ts_assets
-          data: {}
       retries: 3
       timeout: 3600
       onFailure: abortWorkflow
