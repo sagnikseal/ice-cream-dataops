@@ -17,6 +17,7 @@ from cognite.client.data_classes.filters import ContainsAny, Prefix
 from cognite.client.exceptions import CogniteNotFoundError
 
 
+# Written for cognite-sdk==7.89.0 (pin it in requirements.txt).
 global_config.disable_pypi_version_check = True
 
 
@@ -63,28 +64,17 @@ def get_time_series_for_site(
         return []
 
     value_list = [
-        {
-            "space": node.space,
-            "externalId": node.external_id,
-        }
+        {"space": node.space, "externalId": node.external_id}
         for node in sub_tree_nodes
     ]
 
     time_series_batches = [
         client.data_modeling.instances.search(
-            view=ViewId(
-                "cdf_cdm",
-                "CogniteTimeSeries",
-                "v1",
-            ),
+            view=ViewId("cdf_cdm", "CogniteTimeSeries", "v1"),
             instance_type=CogniteTimeSeries,
             space=space,
             filter=ContainsAny(
-                property=[
-                    "cdf_cdm",
-                    "CogniteTimeSeries/v1",
-                    "assets",
-                ],
+                property=["cdf_cdm", "CogniteTimeSeries/v1", "assets"],
                 values=batch,
             ),
             limit=None,
@@ -102,7 +92,8 @@ def get_time_series_for_site(
     if not time_series:
         print(
             f"No CogniteTimeSeries found for {site} in the "
-            "CogniteCore Data Model."
+            "CogniteCore Data Model. Run the 'Contextualize "
+            "Timeseries and Assets' transformation!"
         )
         return []
 
@@ -115,9 +106,9 @@ def handle(
 ) -> None:
     data = data or {}
 
-    lookback_window = timedelta(
-        minutes=data.get("lookback_minutes", 60)
-    )
+    lookback_window = timedelta(minutes=data.get("lookback_minutes", 60))
+    # v7: latest-datapoint timestamps are epoch milliseconds (int).
+    lookback_ms = int(lookback_window.total_seconds() * 1000)
 
     all_sites = [
         "Houston",
@@ -135,19 +126,13 @@ def handle(
     sites = data.get("sites") or all_sites
 
     print(f"Processing datapoints for these sites: {sites}")
-    print(
-        "Lookback window: "
-        f"{lookback_window.total_seconds() / 60:g} minutes"
-    )
+    print(f"Lookback window: {lookback_window.total_seconds() / 60:g} minutes")
+
+    errors = []
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_site = {
-            executor.submit(
-                process_site,
-                client,
-                lookback_window,
-                site,
-            ): site
+            executor.submit(process_site, client, lookback_ms, site): site
             for site in sites
         }
 
@@ -157,20 +142,22 @@ def handle(
             try:
                 future.result()
             except Exception as error:
-                # Log the failing site while allowing the other sites
-                # to finish processing.
+                # Log and keep going so the other sites still finish.
                 print(
                     f"Failed to process site {site}: "
                     f"{type(error).__name__}: {error}"
                 )
+                errors.append((site, error))
 
-                # Re-raise so the Cognite Function call is marked as failed.
-                raise
+    if errors:
+        failed = ", ".join(site for site, _ in errors)
+        # Mark the Cognite Function call as failed after all sites ran.
+        raise RuntimeError(f"OEE calculation failed for: {failed}") from errors[0][1]
 
 
 def process_site(
     client: CogniteClient,
-    lookback_window: timedelta,
+    lookback_ms: int,
     site: str,
 ) -> None:
     oee_space = "oee_ts_space"
@@ -195,18 +182,17 @@ def process_site(
     )
 
     instance_ids = [
-        NodeId(
-            space=source_space,
-            external_id=time_series_node.external_id,
-        )
-        for time_series_node in time_series
-        if time_series_node.external_id
+        NodeId(space=source_space, external_id=ts.external_id)
+        for ts in time_series
+        if ts.external_id
     ]
 
     if not instance_ids:
         print(f"No valid time-series instance IDs found for {site}.")
         return
 
+    # v7: returns a DatapointsList; each item's .timestamp is a list[int]
+    # (epoch ms), empty if the time series has no datapoints.
     all_latest_dps = client.time_series.data.retrieve_latest(
         instance_id=instance_ids,
     )
@@ -215,77 +201,47 @@ def process_site(
         print(f"No latest datapoints found for {site}.")
         return
 
-    # Organize the latest datapoints by equipment.
-    # Comparing the equipment part before ":" avoids partial-string
-    # matches between equipment external IDs.
+    # Group latest datapoints by equipment. Matching on the part before ":"
+    # avoids partial-string matches between equipment external IDs.
     assets_dps = {
-        asset_external_id: [
-            latest_dp
-            for latest_dp in all_latest_dps
+        asset_eid: [
+            dp
+            for dp in all_latest_dps
             if (
-                latest_dp is not None
-                and latest_dp.instance_id is not None
-                and latest_dp.instance_id.external_id is not None
-                and latest_dp.instance_id.external_id.split(
-                    ":",
-                    maxsplit=1,
-                )[0]
-                == asset_external_id
+                dp is not None
+                and dp.instance_id is not None
+                and dp.instance_id.external_id is not None
+                and dp.instance_id.external_id.split(":", maxsplit=1)[0] == asset_eid
             )
         ]
-        for asset_external_id in asset_eids
+        for asset_eid in asset_eids
     }
 
     for asset, latest_dps in assets_dps.items():
         print(f"Calculating OEE for {asset}")
 
+        # v7 + include_aggregate_name=False: dataframe columns are named
+        # str(NodeId(...)), i.e. "NodeId(space, external_id)".
         count_node = f"NodeId({source_space}, {asset}:count)"
         good_node = f"NodeId({source_space}, {asset}:good)"
         status_node = f"NodeId({source_space}, {asset}:status)"
-        planned_status_node = (
-            f"NodeId({source_space}, {asset}:planned_status)"
-        )
+        planned_status_node = f"NodeId({source_space}, {asset}:planned_status)"
 
-        valid_dps = [
-            datapoint
-            for datapoint in latest_dps
-            if (
-                datapoint is not None
-                and datapoint.instance_id is not None
-                and datapoint.timestamp is not None
-            )
-        ]
+        # Keep only series that actually have a latest datapoint.
+        valid_dps = [dp for dp in latest_dps if dp.timestamp]
 
         if not valid_dps:
             print(f"{asset}: No valid latest datapoints found.")
             continue
 
-        # timestamp is a datetime in the current SDK.
-        # Use the earliest latest timestamp so all required input
-        # time series can be aligned to the same complete period.
-        end = min(
-            datapoint.timestamp
-            for datapoint in valid_dps
-        )
+        # Use the earliest of the latest timestamps so all inputs cover
+        # the same complete period. Values are epoch ms (int).
+        end = min(dp.timestamp[0] for dp in valid_dps)
+        start = end - lookback_ms
 
-        # Subtract a timedelta from the datetime timestamp.
-        start = end - lookback_window
+        input_instance_ids = list({dp.instance_id for dp in valid_dps})
 
-        input_instance_ids = list(
-            {
-                datapoint.instance_id
-                for datapoint in valid_dps
-            }
-        )
-
-        if not input_instance_ids:
-            print(f"{asset}: No valid input instance IDs found.")
-            continue
-
-        print(
-            f"{asset}: Retrieving aggregated datapoints "
-            f"from {start} to {end}"
-        )
+        print(f"{asset}: Retrieving aggregated datapoints from {start} to {end}")
 
         dps_df = client.time_series.data.retrieve_dataframe(
             instance_id=input_instance_ids,
@@ -298,29 +254,16 @@ def process_site(
         )
 
         if dps_df is None or dps_df.empty:
-            print(
-                f"{asset}: No datapoints returned between "
-                f"{start} and {end}."
-            )
+            print(f"{asset}: No datapoints returned between {start} and {end}.")
             continue
 
-        required_columns = [
-            count_node,
-            good_node,
-            status_node,
-            planned_status_node,
-        ]
-
-        missing_columns = [
-            column
-            for column in required_columns
-            if column not in dps_df.columns
-        ]
+        required_columns = [count_node, good_node, status_node, planned_status_node]
+        missing_columns = [c for c in required_columns if c not in dps_df.columns]
 
         if missing_columns:
             print(
                 f"{asset}: Missing required OEE time-series columns: "
-                f"{missing_columns}"
+                f"{missing_columns}. Columns returned: {list(dps_df.columns)}"
             )
             continue
 
@@ -328,87 +271,38 @@ def process_site(
         # datapoints when their value changes.
         dps_df = dps_df.ffill()
 
-        # Fill values preceding the first planned_status datapoint
-        # with the opposite of the first available state.
-        planned_status_first_index = (
-            dps_df[planned_status_node].first_valid_index()
-        )
+        # Fill values before the first planned_status datapoint with the
+        # opposite of the first available state.
+        planned_status_first_index = dps_df[planned_status_node].first_valid_index()
 
         if planned_status_first_index is None:
-            print(
-                f"{asset}: No datapoints found for "
-                f"{planned_status_node}."
-            )
+            print(f"{asset}: No datapoints found for {planned_status_node}.")
             continue
 
-        first_planned_status_value = dps_df.at[
-            planned_status_first_index,
-            planned_status_node,
-        ]
-
-        planned_status_backfill_value = (
-            1.0
-            if first_planned_status_value == 0.0
-            else 0.0
+        first_planned_status_value = dps_df.at[planned_status_first_index, planned_status_node]
+        dps_df[planned_status_node] = dps_df[planned_status_node].fillna(
+            value=1.0 if first_planned_status_value == 0.0 else 0.0
         )
 
-        dps_df[planned_status_node] = (
-            dps_df[planned_status_node].fillna(
-                value=planned_status_backfill_value
-            )
-        )
-
-        # Apply the same logic to status.
-        status_first_index = dps_df[
-            status_node
-        ].first_valid_index()
+        # Same for status.
+        status_first_index = dps_df[status_node].first_valid_index()
 
         if status_first_index is None:
-            print(
-                f"{asset}: No datapoints found for {status_node}."
-            )
+            print(f"{asset}: No datapoints found for {status_node}.")
             continue
 
-        first_status_value = dps_df.at[
-            status_first_index,
-            status_node,
-        ]
-
-        status_backfill_value = (
-            1.0
-            if first_status_value == 0.0
-            else 0.0
+        first_status_value = dps_df.at[status_first_index, status_node]
+        dps_df[status_node] = dps_df[status_node].fillna(
+            value=1.0 if first_status_value == 0.0 else 0.0
         )
-
-        dps_df[status_node] = dps_df[
-            status_node
-        ].fillna(value=status_backfill_value)
 
         count_dps = dps_df[count_node]
         good_dps = dps_df[good_node]
         status_dps = dps_df[status_node]
         planned_status_dps = dps_df[planned_status_node]
 
-        total_items = len(count_dps)
-
-        if (
-            total_items != len(good_dps)
-            or total_items != len(status_dps)
-            or total_items != len(planned_status_dps)
-        ):
-            print(
-                f"{asset}: Unable to retrieve aligned datapoints "
-                "for all required OEE time series "
-                "(count, good, status, planned_status) "
-                f"between {start} and {end}."
-            )
-            continue
-
-        if total_items == 0:
-            print(
-                f"{asset}: No aligned input datapoints available "
-                "for the OEE calculation."
-            )
+        if len(count_dps) == 0:
+            print(f"{asset}: No aligned input datapoints available for the OEE calculation.")
             continue
 
         off_spec_node = f"{asset}:off_spec"
@@ -419,34 +313,25 @@ def process_site(
 
         dps_df[off_spec_node] = count_dps - good_dps
 
-        # Calculate with NumPy while handling zero denominators.
+        # Divide safely: zero denominators give 0.0.
         dps_df[quality_node] = np.divide(
             good_dps,
             count_dps,
-            out=np.zeros(
-                count_dps.shape,
-                dtype=float,
-            ),
+            out=np.zeros(count_dps.shape, dtype=float),
             where=count_dps.to_numpy() != 0,
         )
 
         dps_df[performance_node] = np.divide(
             count_dps,
             status_dps,
-            out=np.zeros(
-                count_dps.shape,
-                dtype=float,
-            ),
+            out=np.zeros(count_dps.shape, dtype=float),
             where=status_dps.to_numpy() != 0,
         ) / (60.0 / 3.0)
 
         dps_df[availability_node] = np.divide(
             status_dps,
             planned_status_dps,
-            out=np.zeros(
-                status_dps.shape,
-                dtype=float,
-            ),
+            out=np.zeros(status_dps.shape, dtype=float),
             where=planned_status_dps.to_numpy() != 0,
         )
 
@@ -457,32 +342,18 @@ def process_site(
         )
 
         dps_df = dps_df.fillna(value=0.0)
-        dps_df = dps_df.replace(
-            [np.inf, -np.inf],
-            0.0,
-        )
+        dps_df = dps_df.replace([np.inf, -np.inf], 0.0)
 
-        # Keep only calculated OEE output time series.
+        # Keep only the calculated OEE output series.
         dps_df = dps_df.drop(
-            columns=[
-                count_node,
-                good_node,
-                status_node,
-                planned_status_node,
-            ]
+            columns=[count_node, good_node, status_node, planned_status_node]
         )
 
         to_insert = [
             {
-                "instance_id": NodeId(
-                    space=oee_space,
-                    external_id=external_id,
-                ),
+                "instance_id": NodeId(space=oee_space, external_id=external_id),
                 "datapoints": [
-                    (
-                        timestamp,
-                        float(value),
-                    )
+                    (timestamp, float(value))
                     for timestamp, value in zip(
                         dps_df.index,
                         dps_df[external_id].to_numpy(),
@@ -497,17 +368,14 @@ def process_site(
             continue
 
         try:
-            client.time_series.data.insert_multiple(
-                to_insert
-            )
+            client.time_series.data.insert_multiple(to_insert)
 
         except CogniteNotFoundError as error:
-            # Create missing OEE time-series nodes and retry insertion.
+            # Create the missing OEE time series, then retry the insert.
             time_series_to_create = []
 
             for missing_item in error.not_found:
-                instance_id = missing_item.get("instanceId", {})
-                external_id = instance_id.get("externalId")
+                external_id = missing_item.get("instanceId", {}).get("externalId")
 
                 if not external_id:
                     print(
@@ -516,17 +384,11 @@ def process_site(
                     )
                     continue
 
-                print(
-                    f"Creating CogniteTimeSeries "
-                    f"{oee_space}/{external_id}"
-                )
+                print(f"Creating CogniteTimeSeries {oee_space}/{external_id}")
 
+                # e.g. "OSLPROFILTRASYS185:off_spec" -> "OSLPROFILTRASYS185 Off Spec"
                 name_parts = external_id.split(":")
-                name_parts[-1] = (
-                    name_parts[-1]
-                    .replace("_", " ")
-                    .title()
-                )
+                name_parts[-1] = name_parts[-1].replace("_", " ").title()
 
                 time_series_to_create.append(
                     CogniteTimeSeriesApply(
@@ -541,13 +403,8 @@ def process_site(
             if not time_series_to_create:
                 raise
 
-            client.data_modeling.instances.apply(
-                time_series_to_create
-            )
-
-            client.time_series.data.insert_multiple(
-                to_insert
-            )
+            client.data_modeling.instances.apply(time_series_to_create)
+            client.time_series.data.insert_multiple(to_insert)
 
         print(
             f"{asset}: Inserted {len(dps_df)} datapoints "
